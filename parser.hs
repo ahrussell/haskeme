@@ -30,16 +30,17 @@ parseString = do
                 char '"'
                 x <- many parseEscaped
                 char '"'
-                return $ String $ foldr (++) [] x
+                return $ String x
 
 parseEscaped :: Parser Char
-parseEscaped = do
-            x <- string "\\n"
-            <|> string "\\\""
-            <|> string "\\r"
-            <|> string "\\t"
-            <|> string "\\"
-            <|> liftM $ noneOf "\""            
+parseEscaped = let x =  string "\\n" 
+                    <|> string "\\\"" 
+                    <|> string "\\r" 
+                    <|> string "\\t" 
+                    <|> string "\\" 
+                    <|> (liftM show $ noneOf "\"")
+               in liftM head $ x          
+            
 
 parseAtom :: Parser LispVal
 parseAtom = do 
