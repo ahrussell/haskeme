@@ -33,13 +33,15 @@ parseString = do
                 return $ String x
 
 parseEscaped :: Parser Char
-parseEscaped = let x =  string "\\n" 
-                    <|> string "\\\"" 
-                    <|> string "\\r" 
-                    <|> string "\\t" 
-                    <|> string "\\" 
-                    <|> (liftM show $ noneOf "\"")
-               in liftM head $ x          
+parseEscaped = (char '\\' >> (oneOf "nrt\\\""))
+               <|> noneOf "\""
+-- parseEscaped = let c =  string "\\n" 
+--                     <|> string "\\\"" 
+--                     <|> string "\\r" 
+--                     <|> string "\\t" 
+--                     <|> string "\\" 
+--                     <|> (liftM show $ noneOf "\"")
+--                in liftM head $ c          
             
 
 parseAtom :: Parser LispVal
@@ -53,7 +55,11 @@ parseAtom = do
                             _    -> Atom atom
 
 parseNumber :: Parser LispVal
-parseNumber = liftM (Number . read) $ many1 digit
+parseNumber = do
+                d <- many1 digit
+                    -- <|> readHex
+                    -- <|> many1 digit
+                return $ (Number . read) d
 
 parseExpr :: Parser LispVal
 parseExpr = parseAtom
