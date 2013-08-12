@@ -8,6 +8,8 @@ import Data.Complex
 import Data.Ratio
 import Data.Array
 import Control.Monad.Error
+import System.IO
+import Data.IORef
 
 data LispVal = Atom String
              | List [LispVal]
@@ -30,6 +32,8 @@ data LispError = NumArgs Integer [LispVal]
                | Default String
 
 type ThrowsError = Either LispError
+
+type Env = IORef [(String, IORef LispVal)]
 
 data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
 
@@ -65,10 +69,11 @@ unwordsList :: [LispVal] -> String
 unwordsList = unwords . map show
 
 main :: IO ()
-main = do
-    args <- getArgs
-    evaled <- return $ liftM show $ readExpr (args !! 0) >>= eval
-    putStrLn $ extractValue $ trapError evaled
+main = do args <- getArgs
+          case length args of
+              0 -> runRepl
+              1 -> evalAndPrint $ args !! 0
+              otherwise -> putStrLn "Program takes only 0 or 1 argument"
 
 spaces :: Parser ()
 spaces = skipMany1 space
@@ -400,3 +405,24 @@ parseBin = do try $ string "#b"
             bin2dec' dec (x:xs) = let acc = 2 * dec + (if x == '0' then 0 else 1)
                                   in bin2dec' acc xs
 
+flushStr :: String -> IO ()
+flushStr str = putStr str >> hFlush stdout
+
+readPrompt :: String -> IO String
+readPrompt prompt = flushStr prompt >> getLine
+
+evalString :: String -> IO String
+evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+
+evalAndPrint :: String -> IO ()
+evalAndPrint expr =  evalString expr >>= putStrLn
+
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ pred prompt action = do 
+  result <- prompt
+  if pred result 
+     then return ()
+     else action result >> until_ pred prompt action
+
+runRepl :: IO ()
+runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
