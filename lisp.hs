@@ -584,3 +584,4 @@ bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
           addBinding (var, value) = do ref <- newIORef value
                                        return (var, ref)
 
+
