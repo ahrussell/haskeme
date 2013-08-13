@@ -22,6 +22,9 @@ data LispVal = Atom String
              | Ratio Rational
              | Complex (Complex Double)
              | Vector (Array Int LispVal)
+             | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+             | Func {params :: [String], vararg :: (Maybe String), 
+                      body :: [LispVal], closure :: Env}
 
 data LispError = NumArgs Integer [LispVal]
                | TypeMismatch String LispVal
@@ -35,6 +38,45 @@ type ThrowsError = Either LispError
 
 type Env = IORef [(String, IORef LispVal)]
 
+type IOThrowsError = ErrorT LispError IO
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runErrorT (trapError action) >>= return . extractValue
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lookup var
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef var  =  do env <- liftIO $ readIORef envRef
+                         maybe (throwError $ UnboundVar "Getting an unbound variable" var)
+                               (liftIO . readIORef)
+                               (lookup var env)
+
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef var value = do env <- liftIO $ readIORef envRef
+                             maybe (throwError $ UnboundVar "Setting an unbound variable" var) 
+                                   (liftIO . (flip writeIORef value))
+                                   (lookup var env)
+                             return value
+
+defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defineVar envRef var value = do 
+    alreadyDefined <- liftIO $ isBound envRef var 
+    if alreadyDefined 
+       then setVar envRef var value >> return value
+       else liftIO $ do 
+          valueRef <- newIORef value
+          env <- readIORef envRef
+          writeIORef envRef ((var, valueRef) : env)
+          return value
+
 data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
 
 instance Show LispVal where 
@@ -45,6 +87,12 @@ instance Show LispVal where
     show (Bool False) = "#f"
     show (List contents) = "("++(unwordsList contents) ++")"
     show (DottedList head tail) = "(" ++ unwordsList head ++ " . " ++ show tail ++ ")"
+    show (PrimitiveFunc _) = "<primitive>"
+    show (Func {params = args, vararg = varargs, body = body, closure = env}) = 
+      "(lambda (" ++ unwords (map show args) ++ 
+         (case varargs of 
+            Nothing -> ""
+            Just arg -> " . " ++ arg) ++ ") ...)" 
 
 instance Show LispError where 
     show (UnboundVar message varname) = message ++ ": " ++ varname
@@ -72,7 +120,7 @@ main :: IO ()
 main = do args <- getArgs
           case length args of
               0 -> runRepl
-              1 -> evalAndPrint $ args !! 0
+              1 -> runOne $ args !! 0
               otherwise -> putStrLn "Program takes only 0 or 1 argument"
 
 spaces :: Parser ()
@@ -86,27 +134,53 @@ readExpr input = case parse parseExpr "lisp" input of
     Left err -> throwError $ Parser err
     Right val -> return val
 
-eval :: LispVal -> ThrowsError LispVal
-eval val@(String _) = return val
-eval val@(Number _) = return val
-eval val@(Bool _) = return val
-eval (List [Atom "quote", val]) = return val
-eval (List ((Atom "cond"):xs)) = cond xs
-eval (List ((Atom "case"):key:xs)) = do k <- eval key
-                                        case' k xs
-eval (List [Atom "if", pred, conseq, alt]) = 
-    do result <- eval pred
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval env val@(String _) = return val
+eval env val@(Number _) = return val
+eval env val@(Bool _) = return val
+eval env (Atom id) = getVar env id
+eval env (List [Atom "quote", val]) = return val
+eval env (List ((Atom "cond"):xs)) = cond env xs
+eval env (List ((Atom "case"):key:xs)) = do k <- eval env key
+                                            case' env k xs
+eval env (List [Atom "if", pred, conseq, alt]) = 
+    do result <- eval env pred
        case result of
-         Bool False -> eval alt
-         Bool True -> eval conseq
+         Bool False -> eval env alt
+         Bool True -> eval env conseq
          otherwise -> throwError $ BadSpecialForm "Not a predicate" pred
-eval (List (Atom func : args)) = mapM eval args >>= apply func
-eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+eval env (List [Atom "set!", Atom var, form]) =
+    eval env form >>= setVar env var
+eval env (List [Atom "define", Atom var, form]) =
+    eval env form >>= defineVar env var
+eval env (List (Atom "define" : List (Atom var : params) : body)) =
+    makeNormalFunc env params body >>= defineVar env var
+eval env (List (Atom "define" : DottedList (Atom var : params) varargs : body)) =
+    makeVarargs varargs env params body >>= defineVar env var
+eval env (List (Atom "lambda" : List params : body)) =
+    makeNormalFunc env params body
+eval env (List (Atom "lambda" : DottedList params varargs : body)) =
+    makeVarargs varargs env params body
+eval env (List (Atom "lambda" : varargs@(Atom _) : body)) =
+    makeVarargs varargs env [] body
+eval env (List (function : args)) = do 
+    func <- eval env function
+    argVals <- mapM (eval env) args
+    apply func argVals
+eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
-                        ($ args)
-                        (lookup func primitives)
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params varargs body closure) args = 
+    if num params /= num args && varargs == Nothing
+       then throwError $ NumArgs (num params) args
+       else (liftIO $ bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+    where remainingArgs = drop (length params) args
+          num = toInteger . length
+          evalBody env = liftM last $ mapM (eval env) body 
+          bindVarArgs arg env = case arg of
+              Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
+              Nothing -> return env 
 
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [("+", numericBinop (+)),
@@ -141,28 +215,37 @@ primitives = [("+", numericBinop (+)),
               ("cdr", cdr),
               ("eq?", eqv),
               ("eqv?", eqv),
-              ("equal?", equal),
-              ("cond", cond)]
+              ("equal?", equal)]
+
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+    where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
+    where extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
+          addBinding (var, value) = do ref <- newIORef value
+                                       return (var, ref)
 
 
-cond :: [LispVal] -> ThrowsError LispVal
-cond [] = throwError $ Default "Result of cond is unspecified"
-cond ((List [Atom "else", x]):xs) = eval x 
-cond ((List [pred,  x]):xs) = 
-            do result <- eval pred
+cond :: Env -> [LispVal] -> IOThrowsError LispVal
+cond env [] = throwError $ Default "Result of cond is unspecified"
+cond env ((List [Atom "else", x]):xs) = eval env x 
+cond env ((List [pred,  x]):xs) = 
+            do result <- eval env pred
                case result of
-                  Bool True -> eval x
-                  Bool False -> cond xs
+                  Bool True -> eval env x
+                  Bool False -> cond env xs
                   otherwise -> throwError $ TypeMismatch "Not a predicate" pred
 
-case' :: LispVal -> [LispVal] -> ThrowsError LispVal
-case' _ [] = throwError $ Default "Result of case is unspecified"
-case' k ((List ((List datum):expr)):xs) = let checkEqv k d = unpack $ eqv [k,d]
-                                              unpack (Right (Bool x)) = x
-                                          in
-                                            if (or $ map (checkEqv k) datum)
-                                              then last $ map eval expr
-                                              else case' k xs
+case' :: Env -> LispVal -> [LispVal] -> IOThrowsError LispVal
+case' env _ [] = throwError $ Default "Result of case is unspecified"
+case' env k ((List ((List datum):expr)):xs) = let checkEqv k d = unpack $ eqv [k,d]
+                                                  unpack (Right (Bool x)) = x
+                                              in
+                                                if (or $ map (checkEqv k) datum)
+                                                  then last $ map (eval env) expr
+                                                  else case' env k xs
 
 car :: [LispVal] -> ThrowsError LispVal
 car [List (x : xs)] = return x
@@ -411,11 +494,11 @@ flushStr str = putStr str >> hFlush stdout
 readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
-evalString :: String -> IO String
-evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr =  evalString env expr >>= putStrLn
 
-evalAndPrint :: String -> IO ()
-evalAndPrint expr =  evalString expr >>= putStrLn
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= eval env
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
 until_ pred prompt action = do 
@@ -424,5 +507,12 @@ until_ pred prompt action = do
      then return ()
      else action result >> until_ pred prompt action
 
+runOne :: String -> IO ()
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
+
 runRepl :: IO ()
-runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
+
+makeFunc varargs env params body = return $ Func (map show params) varargs body env
+makeNormalFunc = makeFunc Nothing
+makeVarargs = makeFunc . Just . show
